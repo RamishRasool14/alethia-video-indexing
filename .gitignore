@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.pt
+*.engine
+*.onnx
+finevideo/
+ref/
+*.jsonl
+!ai_chats/*.jsonl
+docs/
+.DS_Store
