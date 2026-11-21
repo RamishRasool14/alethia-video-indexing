@@ -81,7 +81,7 @@ aggregated with the brief's rules, scored against all frames:
 | 21 Nov 14:45 | v3: + 2 GPU inference threads (own TensorRT context + CUDA stream each), pinned shared memory, sequential sampling, --skip-nonref, venv on local disk | 50 files | 589.0 s wall | 0.9828 | 0.9516 | 0.9969 | 1,008,201 frames analysed (deferred middle frames run: 86,588 of 460,639 = 18.8%). 1,735 frames/s; GPU-bound on this pod (3 batches in flight, frames pending). 0 error lines, 461,757 lines. |
 
 | 21 Nov 16:28 | final (commit a40a387): v3 + FP16-input engine built as in prepare.py | 50 files | 620.3 s wall | 0.9827 | 0.9518 | 0.9970 | 1,008,170 frames analysed (deferred run 86,557/460,639). 461,757 lines, 0 errors. Slower than the 589.0 s run despite the faster engine: run-to-run variation on this shared host. -> results.jsonl.gz |
-| 21 Nov 16:39 | v1-simple (tag), full undisturbed timed run | 50 files | running | | | | |
+| 21 Nov 16:39 | v1-simple (tag), full undisturbed timed run | 50 files | 10,961.4 s wall (3 h 2 min 41 s) | 0.9826 | 0.9502 | 0.9968 | Internal timer 10,957.7 s for 1,650 videos. 461,757 lines, 0 error lines. Ended 19:42:11 PKT. Final version (620.3 s) is ~17.7x faster on the same pod. |
 
 ## Sequential sampling (K=3)
 
