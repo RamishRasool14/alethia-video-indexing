@@ -60,7 +60,7 @@ def main():
     ap.add_argument("--input", required=True, help="folder of .parquet files")
     ap.add_argument("--output", required=True, help="output .jsonl path")
     ap.add_argument("--weights", default=os.path.join(HERE, "yolo11l.pt"))
-    ap.add_argument("--per-second", type=int, default=0,
+    ap.add_argument("--per-second", type=int, default=3,
                     help="frames analysed per second (0 = every frame)")
     ap.add_argument("--batch", type=int, default=32)
     args = ap.parse_args()

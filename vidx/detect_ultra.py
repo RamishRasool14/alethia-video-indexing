@@ -18,15 +18,16 @@ class UltralyticsDetector:
         out = np.zeros((len(frames), len(CLASS_IDS)), dtype=np.int16)
         for start in range(0, len(frames), self.batch):
             chunk = frames[start:start + self.batch]
+            kw = {"half": True} if self.half else {}
             results = self.model.predict(
                 chunk,
                 imgsz=IMGSZ,
                 conf=CONF,
                 iou=IOU,
                 classes=CLASS_IDS,
-                half=self.half,
                 device=self.device,
                 verbose=False,
+                **kw,
             )
             for i, r in enumerate(results):
                 cls = r.boxes.cls.int().cpu().numpy()

@@ -1,0 +1,119 @@
+"""YOLO11l inference backends returning the raw (B, 84, N) prediction tensor.
+
+- TensorRT FP16 engine (built once by prepare.py on the target GPU), with a
+  dynamic profile for batch and image size, optimised for 384x640.
+- PyTorch fallback (Ultralytics model, FP16) if the engine is missing or
+  TensorRT cannot load it.
+"""
+import os
+
+import torch
+
+MAX_BATCH = 64
+OPT_HW = (384, 640)
+
+
+def export_onnx(weights, onnx_path):
+    from ultralytics import YOLO
+
+    out = YOLO(weights).export(format="onnx", dynamic=True, imgsz=640, simplify=True,
+                               opset=17, verbose=False)
+    if os.path.abspath(out) != os.path.abspath(onnx_path):
+        os.replace(out, onnx_path)
+    return onnx_path
+
+
+def build_engine(onnx_path, engine_path, max_batch=MAX_BATCH, opt_hw=OPT_HW):
+    import tensorrt as trt
+
+    logger = trt.Logger(trt.Logger.WARNING)
+    builder = trt.Builder(logger)
+    network = builder.create_network(0)
+    parser = trt.OnnxParser(network, logger)
+    with open(onnx_path, "rb") as f:
+        if not parser.parse(f.read()):
+            errs = [str(parser.get_error(i)) for i in range(parser.num_errors)]
+            raise RuntimeError("ONNX parse failed: " + "; ".join(errs))
+    config = builder.create_builder_config()
+    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 8 << 30)
+    config.set_flag(trt.BuilderFlag.FP16)
+    inp = network.get_input(0)
+    profile = builder.create_optimization_profile()
+    profile.set_shape(inp.name, (1, 3, 32, 32), (max_batch, 3, *opt_hw),
+                      (max_batch, 3, 640, 640))
+    config.add_optimization_profile(profile)
+    data = builder.build_serialized_network(network, config)
+    if data is None:
+        raise RuntimeError("TensorRT engine build failed")
+    with open(engine_path, "wb") as f:
+        f.write(data)
+    return engine_path
+
+
+class TRTModel:
+    def __init__(self, engine_path, device="cuda:0"):
+        import tensorrt as trt
+
+        self.trt = trt
+        self.device = torch.device(device)
+        logger = trt.Logger(trt.Logger.WARNING)
+        with open(engine_path, "rb") as f:
+            self.engine = trt.Runtime(logger).deserialize_cuda_engine(f.read())
+        if self.engine is None:
+            raise RuntimeError("could not deserialize TensorRT engine")
+        self.ctx = self.engine.create_execution_context()
+        names = [self.engine.get_tensor_name(i) for i in range(self.engine.num_io_tensors)]
+        self.inp = next(n for n in names
+                        if self.engine.get_tensor_mode(n) == trt.TensorIOMode.INPUT)
+        self.out = next(n for n in names
+                        if self.engine.get_tensor_mode(n) == trt.TensorIOMode.OUTPUT)
+        self.in_dtype = torch.float16 if self.engine.get_tensor_dtype(self.inp) == trt.float16 \
+            else torch.float32
+        self.out_dtype = torch.float16 if self.engine.get_tensor_dtype(self.out) == trt.float16 \
+            else torch.float32
+        self.max_batch = self.engine.get_tensor_profile_shape(self.inp, 0)[2][0]
+        self.stream = torch.cuda.Stream(self.device)
+
+    def __call__(self, x):
+        x = x.to(self.in_dtype).contiguous()
+        self.ctx.set_input_shape(self.inp, tuple(x.shape))
+        out = torch.empty(tuple(self.ctx.get_tensor_shape(self.out)), dtype=self.out_dtype,
+                          device=self.device)
+        self.ctx.set_tensor_address(self.inp, x.data_ptr())
+        self.ctx.set_tensor_address(self.out, out.data_ptr())
+        cur = torch.cuda.current_stream(self.device)
+        self.stream.wait_stream(cur)
+        self.ctx.execute_async_v3(self.stream.cuda_stream)
+        cur.wait_stream(self.stream)
+        return out
+
+
+class TorchModel:
+    def __init__(self, weights, device="cuda:0", half=True):
+        from ultralytics import YOLO
+
+        self.device = torch.device(device)
+        self.half = half
+        m = YOLO(weights).model.to(self.device).eval()
+        m = m.fuse() if hasattr(m, "fuse") else m
+        self.model = m.half() if half else m.float()
+        self.max_batch = MAX_BATCH
+
+    @torch.inference_mode()
+    def __call__(self, x):
+        x = x.half() if self.half else x.float()
+        y = self.model(x)
+        return y[0] if isinstance(y, (list, tuple)) else y
+
+
+def load_model(weights, engine_path, log=print):
+    if engine_path and os.path.exists(engine_path):
+        try:
+            m = TRTModel(engine_path)
+            log(f"backend: TensorRT engine {engine_path}")
+            return m
+        except Exception as e:  # fall back rather than fail the run
+            log(f"TensorRT unavailable ({type(e).__name__}: {e}); using PyTorch FP16")
+    else:
+        log("backend: PyTorch FP16 (no TensorRT engine found)")
+    return TorchModel(weights)
