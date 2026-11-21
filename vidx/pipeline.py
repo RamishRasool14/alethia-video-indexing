@@ -181,6 +181,8 @@ def run(input_dir, output_path, model_factory, n_workers, per_second_k=3, skip_n
     batch_q = queue.Queue()
     result_q = queue.Queue()
 
+    in_dtype = getattr(model, "in_dtype", torch.float32)
+
     def infer_loop():
         stream = torch.cuda.Stream()
         runner = model.runner()
@@ -203,7 +205,8 @@ def run(input_dir, output_path, model_factory, n_workers, per_second_k=3, skip_n
                     x = torch.cat(parts) if len(parts) > 1 else parts[0]
                     copied = torch.cuda.Event()
                     copied.record(stream)
-                    x = x.permute(0, 3, 1, 2).flip(1).float().div_(255)  # BGR->RGB, 0..1
+                    # BGR->RGB, scale to 0..1, in the engine's input precision
+                    x = x.permute(0, 3, 1, 2).flip(1).to(in_dtype).div_(255)
                     counts = []
                     for i in range(0, x.shape[0], model.max_batch):
                         counts.append(count_classes(runner(x[i:i + model.max_batch])))

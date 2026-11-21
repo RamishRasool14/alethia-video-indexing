@@ -30,7 +30,7 @@ def main():
     if not os.path.exists(onnx_path):
         export_onnx(weights, onnx_path)
     print(f"onnx: {onnx_path}")
-    build_engine(onnx_path, engine_path + ".part")
+    build_engine(onnx_path, engine_path + ".part", fp16_io=True)
     os.replace(engine_path + ".part", engine_path)
     print(f"engine: {engine_path} ({time.time() - t:.0f}s)")
 

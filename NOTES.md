@@ -167,3 +167,29 @@ same structure for every row:
 - B-frame skipping made the default (`--no-skip-nonref` turns it off): faster
   and the per-video number of output seconds was identical to full decoding
   for all 1,650 videos.
+
+## Fresh install test (tools/fresh_install_test.sh, 21 Nov ~16:00 PKT)
+
+Clean copy of the committed repo (git archive HEAD), new Python 3.11 venv,
+`pip install -r requirements.txt` (pip check: no broken requirements),
+`python prepare.py`, `python run.py` on the 3-file subset.
+- First attempt failed: the pod's 30 GB container disk ran out during pip
+  install (torch wheels unpack in /tmp). Re-run with TMPDIR and the venv on the
+  100 GB volume.
+- prepare.py: 397 s (ONNX export 11 s, TensorRT engine build 385 s). No
+  Ultralytics auto-install during export (onnxruntime already pinned).
+- run.py on 3 files: 47.1 s internal, 63.4 s wall (venv on the network volume,
+  so imports are slow here). 30,447 lines.
+- Versus the development engine: 84 of 30,447 lines differ (0.28%), all small
+  people-count or presence flips. Each TensorRT build may pick different FP16
+  kernels, so outputs near thresholds can change between builds.
+
+## Engine variants (benchmark: 64x384x640 uint8 -> pre-processing -> TensorRT -> NMS, best of 3)
+
+| Engine | Build time | frames/s |
+|---|---|---|
+| FP16, FP32 input (fresh build) | 385 s | 1,961-1,965 |
+| FP16, FP16 input, default optimisation level | 366 s | 1,997 |
+| FP16, FP16 input, builder optimisation level 5 | 1,484 s | 1,998-2,005 |
+
+prepare.py now builds the FP16-input engine at the default level.

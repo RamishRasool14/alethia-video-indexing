@@ -30,7 +30,7 @@ python prepare.py
 
 It downloads the official `yolo11l.pt` next to `run.py`, exports it to ONNX
 (dynamic batch and image size) and builds a TensorRT FP16 engine
-(`yolo11l.engine`) for the GPU it runs on. The build takes about 5 to 10
+(`yolo11l.engine`, FP16 input) for the GPU it runs on. The build takes about 5 to 10
 minutes. If the engine is missing or cannot be loaded, `run.py` falls back to
 PyTorch FP16 automatically (slower, same output format).
 

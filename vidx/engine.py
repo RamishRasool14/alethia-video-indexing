@@ -59,7 +59,7 @@ class _Calibrator:
 
 
 def build_engine(onnx_path, engine_path, max_batch=MAX_BATCH, opt_hw=OPT_HW,
-                 int8_frames=None, int8_cache=None):
+                 int8_frames=None, int8_cache=None, fp16_io=False, opt_level=None):
     import tensorrt as trt
 
     logger = trt.Logger(trt.Logger.WARNING)
@@ -73,7 +73,11 @@ def build_engine(onnx_path, engine_path, max_batch=MAX_BATCH, opt_hw=OPT_HW,
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 8 << 30)
     config.set_flag(trt.BuilderFlag.FP16)
+    if opt_level is not None:
+        config.builder_optimization_level = opt_level
     inp = network.get_input(0)
+    if fp16_io:  # feed half precision directly (pre-processing writes FP16)
+        inp.dtype = trt.float16
     profile = builder.create_optimization_profile()
     profile.set_shape(inp.name, (1, 3, 32, 32), (max_batch, 3, *opt_hw),
                       (max_batch, 3, 640, 640))
@@ -146,6 +150,7 @@ class TorchModel:
 
         self.device = torch.device(device)
         self.half = half
+        self.in_dtype = torch.float16 if half else torch.float32
         m = YOLO(weights).model.to(self.device).eval()
         m = m.fuse() if hasattr(m, "fuse") else m
         self.model = m.half() if half else m.float()
