@@ -17,11 +17,16 @@ MAX_NMS = 30000  # Ultralytics defaults
 MAX_DET = 300
 
 
+_CLS = {}
+
+
 def count_classes(pred, conf=CONF, iou=IOU):
     """pred: (B, 4 + 80, N) raw YOLO output -> int32 tensor (B, 5) on GPU."""
     B = pred.shape[0]
     device = pred.device
-    cls_ids = torch.tensor(CLASS_IDS, device=device)
+    cls_ids = _CLS.get(device)
+    if cls_ids is None:
+        cls_ids = _CLS[device] = torch.tensor(CLASS_IDS, device=device)
     p = pred.transpose(1, 2)  # (B, N, 84)
     scores, labels = p[..., 4:].max(-1)  # best class per box
     keep = (scores > conf) & torch.isin(labels, cls_ids)

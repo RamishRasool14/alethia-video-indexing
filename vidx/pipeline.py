@@ -1,16 +1,23 @@
-"""Fast pipeline: parallel decode workers -> shared memory -> one GPU loop.
+"""Fast pipeline: parallel decode workers -> shared memory -> GPU threads.
 
-Main process:
-  - a reader thread reads Parquet files in order and puts (video id, mp4
-    bytes) on the task queue (error rows go straight to the output);
-  - N worker processes decode/sample/letterbox into shared-memory chunks
-    (see worker.py);
-  - the main thread batches frames of the same shape, runs YOLO on the GPU,
-    counts the five classes per frame, decides which deferred frames are
-    needed (sequential sampling), and writes each video's lines as soon as it
-    is complete;
-  - a worker that dies (e.g. a decoder crash on a damaged file) is replaced,
-    and its current video gets an error line.
+Main process, main thread:
+  - starts a reader thread that reads Parquet files in order and puts
+    (video id, mp4 bytes) on the task queue (rows that cannot be read go
+    straight to the output as error lines);
+  - starts N decode worker processes (worker.py) that sample, letterbox and
+    write frames into shared-memory chunks;
+  - routes worker messages, forms batches of same-shape frames, decides which
+    deferred frames are needed (sequential sampling), and writes each video's
+    lines as soon as it is complete;
+  - replaces a worker that dies (e.g. decoder crash) and writes an error line
+    for the video it was on.
+Main process, inference threads (2 by default):
+  - each has its own CUDA stream and TensorRT execution context, so one batch
+    is copied/pre-processed while another runs: the GPU never waits for
+    Python bookkeeping;
+  - copies frames from pinned shared memory, converts BGR uint8 -> RGB float,
+    runs YOLO11l, counts the five classes per frame (GPU NMS) and returns the
+    counts.
 """
 import json
 import multiprocessing as mp
@@ -59,17 +66,46 @@ def records_for(vid, st):
 
 class Deferred:
     """A deferred chunk waiting for its seconds' primary results."""
-    __slots__ = ("msg", "need", "decided", "n_undecided")
+    __slots__ = ("wk", "msg", "need", "n_undecided")
 
-    def __init__(self, msg):
-        self.msg = msg
-        n = msg[4]
-        self.need = [None] * n
-        self.n_undecided = n
+    def __init__(self, wk, msg):
+        self.wk, self.msg = wk, msg
+        self.need = [None] * msg[4]
+        self.n_undecided = msg[4]
+
+
+class Item:
+    """Frames of one chunk (all, or a subset `idx`) waiting for the GPU."""
+    __slots__ = ("wk", "cid", "idx", "n", "vid", "secs", "kind")
+
+    def __init__(self, wk, cid, idx, n, vid, secs, kind):
+        self.wk, self.cid, self.idx, self.n = wk, cid, idx, n
+        self.vid, self.secs, self.kind = vid, secs, kind
+
+
+def _pin(block):
+    """Page-lock a shared-memory block so host->GPU copies are fast DMA."""
+    import torch
+
+    try:
+        rc = torch.cuda.cudart().cudaHostRegister(block.ctypes.data, block.nbytes, 0)
+        return int(rc) == 0 if not hasattr(rc, "value") else rc.value == 0
+    except Exception:
+        return False
+
+
+def _unpin(block):
+    import torch
+
+    try:
+        torch.cuda.cudart().cudaHostUnregister(block.ctypes.data)
+    except Exception:
+        pass
 
 
 def run(input_dir, output_path, model_factory, n_workers, per_second_k=3, skip_nonref=False,
-        sequential=True, max_batch=64, chunk_frames=32, chunks_per_worker=6, debug=False):
+        sequential=True, max_batch=64, chunk_frames=32, chunks_per_worker=6,
+        gpu_threads=2, debug=False):
     import torch
 
     from .postprocess import count_classes
@@ -85,7 +121,9 @@ def run(input_dir, output_path, model_factory, n_workers, per_second_k=3, skip_n
            "sequential": sequential}
     task_q = ctx.Queue(maxsize=max(4, n_workers))
     msg_q = ctx.Queue()
-    workers = {}  # wid -> dict(proc, free_q, shm, block, current)
+    workers = {}  # wid -> dict(proc, free_q, shm, block, current, pinned)
+    retired = []  # shared memory of dead workers, freed at the end
+    cuda_ready = [False]
 
     def start_worker(wid):
         shm = shared_memory.SharedMemory(create=True,
@@ -98,7 +136,11 @@ def run(input_dir, output_path, model_factory, n_workers, per_second_k=3, skip_n
                         args=(wid, task_q, msg_q, free_q, shm.name, chunks_per_worker,
                               chunk_frames, cfg))
         p.start()
-        workers[wid] = dict(proc=p, free_q=free_q, shm=shm, block=block, current=None)
+        wk = dict(wid=wid, proc=p, free_q=free_q, shm=shm, block=block, current=None,
+                  pinned=False)
+        if cuda_ready[0]:
+            wk["pinned"] = _pin(block)
+        workers[wid] = wk
 
     videos = {}  # vid -> VideoState
     reader_done = threading.Event()
@@ -127,10 +169,55 @@ def run(input_dir, output_path, model_factory, n_workers, per_second_k=3, skip_n
     for wid in range(n_workers):
         start_worker(wid)
     model = model_factory()
-    log(f"[{time.time() - t0:7.1f}s] model ready")
+    cuda_ready[0] = True
+    for wk in workers.values():
+        wk["pinned"] = _pin(wk["block"])
+    log(f"[{time.time() - t0:7.1f}s] model ready; pinned {sum(w['pinned'] for w in workers.values())}"
+        f"/{len(workers)} buffers")
 
-    pending = defaultdict(list)  # (h, w) -> items (wid, cid, idx|None, n, vid, secs, kind, ref)
+    # ------------------------------------------------------------ GPU threads
+    batch_q = queue.Queue()
+    result_q = queue.Queue()
+
+    def infer_loop():
+        stream = torch.cuda.Stream()
+        runner = model.runner()
+        with torch.cuda.stream(stream), torch.inference_mode():
+            while True:
+                job = batch_q.get()
+                if job is None:
+                    break
+                items, h, w = job
+                try:
+                    parts = []
+                    for it in items:
+                        view = it.wk["block"][it.cid]
+                        if it.idx is None:
+                            arr = view[: it.n * h * w * 3].reshape(it.n, h, w, 3)
+                        else:
+                            arr = view[: (int(it.idx[-1]) + 1) * h * w * 3].reshape(
+                                -1, h, w, 3)[it.idx]
+                        parts.append(torch.from_numpy(arr).to("cuda", non_blocking=True))
+                    x = torch.cat(parts) if len(parts) > 1 else parts[0]
+                    copied = torch.cuda.Event()
+                    copied.record(stream)
+                    x = x.permute(0, 3, 1, 2).flip(1).float().div_(255)  # BGR->RGB, 0..1
+                    counts = []
+                    for i in range(0, x.shape[0], model.max_batch):
+                        counts.append(count_classes(runner(x[i:i + model.max_batch])))
+                    copied.synchronize()
+                    counts = torch.cat(counts).cpu().numpy()
+                    result_q.put((items, counts, None))
+                except Exception as e:  # report, never kill the thread
+                    result_q.put((items, None, e))
+
+    threads = [threading.Thread(target=infer_loop, daemon=True) for _ in range(gpu_threads)]
+    for t in threads:
+        t.start()
+
+    pending = defaultdict(list)  # (h, w) -> [Item]
     n_pending = defaultdict(int)
+    in_flight = [0]
     stats = {"finished": 0, "frames": 0, "deferred_total": 0, "deferred_run": 0}
     last_report = time.time()
 
@@ -143,7 +230,7 @@ def run(input_dir, output_path, model_factory, n_workers, per_second_k=3, skip_n
 
     def enqueue(item, h, w):
         pending[(h, w)].append(item)
-        n_pending[(h, w)] += item[3]
+        n_pending[(h, w)] += item.n
 
     def try_decide(st, d):
         """Decide deferred frames whose seconds have all their primaries."""
@@ -166,9 +253,9 @@ def run(input_dir, output_path, model_factory, n_workers, per_second_k=3, skip_n
         stats["deferred_total"] += n
         stats["deferred_run"] += len(idx)
         if len(idx):
-            enqueue((wid, cid, idx, len(idx), vid, [secs[i] for i in idx], "d", None), h, w)
+            enqueue(Item(d.wk, cid, idx, len(idx), vid, [secs[i] for i in idx], "d"), h, w)
         else:
-            workers[wid]["free_q"].put(cid)
+            d.wk["free_q"].put(cid)
             st.chunks_done += 1
         return True
 
@@ -182,10 +269,11 @@ def run(input_dir, output_path, model_factory, n_workers, per_second_k=3, skip_n
             _, wid, cid, vid, n, h, w, secs, ckind, _ = msg
             st = videos[vid]
             st.chunks_sent += 1
+            wk = workers[wid]
             if ckind == "p":
-                enqueue((wid, cid, None, n, vid, secs, "p", None), h, w)
+                enqueue(Item(wk, cid, None, n, vid, secs, "p"), h, w)
             else:
-                d = Deferred(msg)
+                d = Deferred(wk, msg)
                 if not try_decide(st, d):
                     st.waiting.append(d)
         elif kind == "end":
@@ -194,54 +282,59 @@ def run(input_dir, output_path, model_factory, n_workers, per_second_k=3, skip_n
             videos[vid].end = (last_second, n_decoded, error)
             finalize_ready(vid)
 
-    def run_batch(shape):
-        h, w = shape
-        items, total = [], 0
+    def submit(shape):
         lst = pending[shape]
+        items, total = [], 0
         while lst and total < max_batch:
             it = lst.pop(0)
             items.append(it)
-            total += it[3]
+            total += it.n
         n_pending[shape] -= total
-        parts = []
-        for (wid, cid, idx, n, vid, secs, kind, _) in items:
-            view = workers[wid]["block"][cid]
-            if idx is None:
-                arr = view[: n * h * w * 3].reshape(n, h, w, 3)
-            else:
-                arr = view[: (int(idx[-1]) + 1) * h * w * 3].reshape(-1, h, w, 3)[idx]
-            parts.append(torch.from_numpy(arr).to("cuda"))
-            workers[wid]["free_q"].put(cid)
-        x = torch.cat(parts) if len(parts) > 1 else parts[0]
-        x = x.permute(0, 3, 1, 2).flip(1).float().div_(255)  # BGR->RGB, 0..1
-        counts = []
-        for i in range(0, x.shape[0], model.max_batch):
-            counts.append(count_classes(model(x[i:i + model.max_batch])))
-        counts = torch.cat(counts).cpu().numpy()
-        off = 0
+        in_flight[0] += 1
+        batch_q.put((items, shape[0], shape[1]))
+
+    def handle_result(res):
+        items, counts, err = res
+        in_flight[0] -= 1
+        if err is not None:
+            raise err
         touched = set()
-        for (wid, cid, idx, n, vid, secs, kind, _) in items:
-            st = videos[vid]
-            c = counts[off:off + n]
-            off += n
-            st.secs.append(np.asarray(secs, np.int64))
+        off = 0
+        for it in items:
+            it.wk["free_q"].put(it.cid)
+            st = videos.get(it.vid)
+            c = counts[off:off + it.n]
+            off += it.n
+            stats["frames"] += it.n
+            if st is None:
+                continue
+            st.secs.append(np.asarray(it.secs, np.int64))
             st.counts.append(c)
             st.chunks_done += 1
-            if kind == "p":
+            if it.kind == "p":
                 pres = c > 0
-                for j, s in enumerate(secs):
+                for j, s in enumerate(it.secs):
                     st.prim[s].append((pres[j].tobytes(), int(c[j, 0])))
-                touched.add(vid)
+                touched.add(it.vid)
             else:
-                finalize_ready(vid)
+                finalize_ready(it.vid)
         for vid in touched:
             st = videos.get(vid)
-            if st is None:  # already complete and written in the loop above
+            if st is None:  # already complete and written above
                 continue
             if st.waiting:
                 st.waiting = [d for d in st.waiting if not try_decide(st, d)]
             finalize_ready(vid)
-        stats["frames"] += total
+
+    def drain_results(block=False):
+        got = False
+        while True:
+            try:
+                res = result_q.get(timeout=0.5) if block and not got else result_q.get_nowait()
+            except queue.Empty:
+                return got
+            handle_result(res)
+            got = True
 
     def check_workers():
         for wid, wk in list(workers.items()):
@@ -249,71 +342,90 @@ def run(input_dir, output_path, model_factory, n_workers, per_second_k=3, skip_n
                 continue
             vid = wk["current"]
             log(f"worker {wid} died (exit {wk['proc'].exitcode}) on {vid}; restarting")
-            # finish the work it already handed over (its memory is ours)
+            # its deferred chunks can no longer be completed: analyse all frames
             for st in list(videos.values()):
+                keep = []
                 for d in st.waiting:
-                    if d.msg[1] == wid:
+                    if d.wk is wk:
                         d.need = [True if x is None else x for x in d.need]
                         d.n_undecided = 0
                         try_decide(st, d)
-                st.waiting = [d for d in st.waiting if d.n_undecided]
-            while True:
-                shapes = [sh for sh, lst in pending.items() if any(it[0] == wid for it in lst)]
-                if not shapes:
-                    break
-                run_batch(shapes[0])
+                    else:
+                        keep.append(d)
+                st.waiting = keep
+            # wait until everything it handed over has been analysed
+            while any(it.wk is wk for lst in pending.values() for it in lst) or in_flight[0]:
+                for sh, lst in list(pending.items()):
+                    if lst:
+                        submit(sh)
+                drain_results(block=True)
             if vid is not None and vid in videos:
                 st = videos[vid]
                 secs = np.concatenate(st.secs) if st.secs else np.zeros(0, np.int64)
                 st.end = (int(secs.max()) if len(secs) else -1, 0,
                           "could not decode video: decoder crashed")
                 finalize_ready(vid)
-            wk["shm"].close()
-            wk["shm"].unlink()
+            retired.append(wk)
             del workers[wid]
             start_worker(wid)
 
+    max_in_flight = gpu_threads + 1
     try:
         while True:
             while not direct_errors.empty():
                 out.write(json.dumps(direct_errors.get()) + "\n")
-            got = False
+            got = drain_results()
             try:
-                msg = msg_q.get(timeout=0.002 if any(n_pending.values()) else 0.05)
-                handle(msg)
+                timeout = 0.001 if (any(n_pending.values()) or in_flight[0]) else 0.05
+                handle(msg_q.get(timeout=timeout))
                 got = True
                 while True:  # drain without blocking
                     handle(msg_q.get_nowait())
             except queue.Empty:
                 pass
-            # run a batch if any shape has a full batch, or if nothing new arrived
-            ready = [s for s, n in n_pending.items() if n >= max_batch]
-            if not ready and not got:
-                ready = [s for s, n in n_pending.items() if n > 0]
-            if ready:
-                run_batch(max(ready, key=lambda s: n_pending[s]))
-            elif not got:
+            # keep the GPU threads fed: full batches first; partial batches
+            # only when the GPU would otherwise go idle
+            while in_flight[0] < max_in_flight:
+                ready = [s for s, n in n_pending.items() if n >= max_batch]
+                if not ready and in_flight[0] < gpu_threads:
+                    ready = [s for s, n in n_pending.items() if n > 0]
+                if not ready:
+                    break
+                submit(max(ready, key=lambda s: n_pending[s]))
+                got = True
+            if not got:
                 check_workers()
-                if reader_done.is_set() and direct_errors.empty() \
+                if reader_done.is_set() and direct_errors.empty() and not in_flight[0] \
                         and stats["finished"] >= n_tasks[0] and not videos:
                     break
             if debug and time.time() - last_report > 30:
                 el = time.time() - t0
                 log(f"[{el:7.1f}s] videos done {stats['finished']}, frames {stats['frames']} "
-                    f"({stats['frames'] / el:.0f}/s)")
+                    f"({stats['frames'] / el:.0f}/s) in flight {in_flight[0]} "
+                    f"pending {sum(n_pending.values())} tasks queued {task_q.qsize()}")
                 last_report = time.time()
     finally:
         task_q.cancel_join_thread()  # never block exit on unread tasks
+        for _ in threads:
+            batch_q.put(None)
         for _ in workers:
             try:
                 task_q.put_nowait(None)
             except Exception:
                 pass
-        for wk in workers.values():
+        for t in threads:
+            t.join(timeout=10)
+        for wk in list(workers.values()) + retired:
             wk["proc"].join(timeout=5)
             if wk["proc"].is_alive():
                 wk["proc"].kill()
-            wk["shm"].close()
+            if wk["pinned"]:
+                _unpin(wk["block"])
+            del wk["block"]
+            try:
+                wk["shm"].close()
+            except BufferError:  # a view may still be referenced; unlink anyway
+                pass
             try:
                 wk["shm"].unlink()
             except FileNotFoundError:

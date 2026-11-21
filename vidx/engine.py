@@ -51,6 +51,8 @@ def build_engine(onnx_path, engine_path, max_batch=MAX_BATCH, opt_hw=OPT_HW):
 
 
 class TRTModel:
+    """Loaded engine; call runner() once per inference thread."""
+
     def __init__(self, engine_path, device="cuda:0"):
         import tensorrt as trt
 
@@ -61,7 +63,6 @@ class TRTModel:
             self.engine = trt.Runtime(logger).deserialize_cuda_engine(f.read())
         if self.engine is None:
             raise RuntimeError("could not deserialize TensorRT engine")
-        self.ctx = self.engine.create_execution_context()
         names = [self.engine.get_tensor_name(i) for i in range(self.engine.num_io_tensors)]
         self.inp = next(n for n in names
                         if self.engine.get_tensor_mode(n) == trt.TensorIOMode.INPUT)
@@ -72,20 +73,28 @@ class TRTModel:
         self.out_dtype = torch.float16 if self.engine.get_tensor_dtype(self.out) == trt.float16 \
             else torch.float32
         self.max_batch = self.engine.get_tensor_profile_shape(self.inp, 0)[2][0]
-        self.stream = torch.cuda.Stream(self.device)
+        self._default = None
+
+    def runner(self):
+        """A callable with its own execution context, run on the caller's stream."""
+        ctx = self.engine.create_execution_context()
+
+        def run(x):
+            x = x.to(self.in_dtype).contiguous()
+            ctx.set_input_shape(self.inp, tuple(x.shape))
+            out = torch.empty(tuple(ctx.get_tensor_shape(self.out)), dtype=self.out_dtype,
+                              device=self.device)
+            ctx.set_tensor_address(self.inp, x.data_ptr())
+            ctx.set_tensor_address(self.out, out.data_ptr())
+            ctx.execute_async_v3(torch.cuda.current_stream(self.device).cuda_stream)
+            return out
+
+        return run
 
     def __call__(self, x):
-        x = x.to(self.in_dtype).contiguous()
-        self.ctx.set_input_shape(self.inp, tuple(x.shape))
-        out = torch.empty(tuple(self.ctx.get_tensor_shape(self.out)), dtype=self.out_dtype,
-                          device=self.device)
-        self.ctx.set_tensor_address(self.inp, x.data_ptr())
-        self.ctx.set_tensor_address(self.out, out.data_ptr())
-        cur = torch.cuda.current_stream(self.device)
-        self.stream.wait_stream(cur)
-        self.ctx.execute_async_v3(self.stream.cuda_stream)
-        cur.wait_stream(self.stream)
-        return out
+        if self._default is None:
+            self._default = self.runner()
+        return self._default(x)
 
 
 class TorchModel:
@@ -104,6 +113,9 @@ class TorchModel:
         x = x.half() if self.half else x.float()
         y = self.model(x)
         return y[0] if isinstance(y, (list, tuple)) else y
+
+    def runner(self):
+        return self
 
 
 def load_model(weights, engine_path, log=print):
