@@ -1,7 +1,107 @@
 # Engineering log
 
 Plain record of what was run, what changed, and the measured numbers.
-Times are wall-clock on the RunPod RTX 4090 pod (see HARDWARE.md).
+Times are wall-clock on the RunPod pod described in HARDWARE.md unless noted.
+"Gates" = brief section 5: object F1 >= 0.95, people exact >= 85%, within 1 >= 95%.
 
-| When (PKT) | Version / change | Data | Wall time | F1 | People exact | Within 1 | Notes |
+## Pod
+
+- RunPod Secure cloud, RTX 4090 24 GB, driver 595.112.07, AMD EPYC 7452
+  (container CPU quota 13.6 cores, 16 vCPU allocated), 1 TB host RAM visible
+  (125 GB allocated), Ubuntu 22.04.5, Python 3.11.10. Created 21 Nov 12:54 PKT.
+- Dataset download (`hf download ... train-000[0-4]*`): 50 files, 24 GB, 31 s.
+
+## Data survey (tools/inspect_data.py, all 50 files)
+
+- 1,650 videos, 128.0 hours, 12,981,615 frames. 0 videos failed to open.
+- Codec: H.264 for all 1,650; pixel format yuv420p for all.
+- Sizes: 640x360 = 1,284; 360x640 (portrait) = 141; 480x360 = 49; 270x480 = 31;
+  202x360 = 28; others < 10 each. Largest dimension is 640 everywhere.
+- Frame rates: 29.97 = 575, 30 = 505, 25 = 265, 23.98 = 177, 24 = 71, plus a few
+  at 7-15 fps.
+- Rotation tags: none in these 50 files.
+- B-frames present in 1,376 of 1,650 videos.
+- Each Parquet file is a single row group (~500 MB).
+- Duration per video: 19 s to 658 s, median 242 s.
+
+## Checks on synthetic inputs
+
+- Rotation: test video tagged 90/180/270 degrees. Our PyAV frames after rotation
+  are pixel-identical (mean abs diff 0.0) to OpenCV's auto-rotated frames and
+  to ffmpeg CLI output.
+- Damaged inputs (first version): unreadable Parquet file, truncated mp4, random
+  bytes, empty bytes, null row -> one error line each, run continues.
+
+## Reference (tools/reference.py)
+
+- 59 videos sampled (44 random + portrait, odd sizes, low fps, no-B-frame cases),
+  4.15 hours, 412,151 frames, 14,958 seconds.
+- Plain Ultralytics predict, FP32, every frame. 3 processes sharing the GPU,
+  ~300 frames/s total, ~25 min.
+
+## Sampling simulation (tools/simulate.py, reference per-frame counts)
+
+Frames analysed per second (K), taking the first frame in each 1/K-second slot,
+aggregated with the brief's rules, scored against all frames:
+
+| K | frames used | F1 | exact | within 1 |
+|---|---|---|---|---|
+| 1 | 3.6% | 0.9528 | 0.8954 | 0.9811 |
+| 2 | 7.3% | 0.9654 | 0.9241 | 0.9952 |
+| 3 | 10.9% | 0.9826 | 0.9502 | 0.9968 |
+| 4 | 14.5% | 0.9828 | 0.9551 | 0.9989 |
+| 5 | 18.1% | 0.9891 | 0.9673 | 0.9985 |
+| 6 | 21.7% | 0.9886 | 0.9690 | 0.9994 |
+| 8 | 28.9% | 0.9919 | 0.9758 | 0.9997 |
+| 10 | 36.1% | 0.9936 | 0.9801 | 1.0000 |
+| 15 | 53.8% | 0.9967 | 0.9899 | 0.9998 |
+
+## Micro-benchmarks
+
+- Decode (PyAV, 360p H.264, one core): ~2,100 frames/s; with skip_frame=NONREF
+  (B-frames skipped) a video is processed ~1.8x faster. +bgr24 conversion of
+  every frame: ~1,600 frames/s.
+- Decode in parallel (24 videos): 4 processes 6,856 fps; 8 processes 11,466 fps;
+  12 processes 14,611 fps. Threads: 8 -> 10,493 fps, 12 -> 9,468 fps.
+  (Measured while the reference used ~3 cores.)
+- TensorRT 10.9 FP16 engine, dynamic shape optimised for 384x640, incl. GPU NMS:
+  bs16 1,817 fps, bs32 1,989 fps, bs64 1,996 fps. PyTorch FP16 bs64: 921 fps.
+  Engine build took 548 s (GPU shared with reference at the time).
+- Same 1,024 frames, per-frame counts identical to Ultralytics FP32 predict:
+  TensorRT FP16 99.41%, PyTorch FP16 99.80%, PyTorch FP32 with our own
+  letterbox/NMS 99.90%.
+
+## Runs
+
+| Start (PKT) | Version | Data | Wall time | F1 | Exact | Within 1 | Notes |
 |---|---|---|---|---|---|---|---|
+| 21 Nov 13:33 | v1-simple (tag), K=3, 1 process, Ultralytics FP32 bs32 | 50 files | stopped after 340 s | | | | Processed 12,838 video-seconds in 340 s (~37.8 video-s per s), i.e. ~3.4 h projected for 461,757 s. Stopped to free the GPU for development; to be re-run in full, undisturbed. |
+| 21 Nov 14:20 | fast v2: 13 decode processes + shared memory + TensorRT FP16 bs64 + GPU NMS, K=3 | 50 files | 940.5 s (internal timer; excludes ~20 s start-up) | 0.9824 | 0.9495 | 0.9967 | 1,383,597 frames analysed, 1,474 frames/s. CPU-bound: 13 workers decoding every frame. GPU ~80% busy. 0 error lines. |
+
+## Sequential sampling (K=3)
+
+- Idea: analyse slots 0 and 2 of each second first; analyse slot 1 only if those
+  two frames disagree on any of the 5 classes or on the people count. If they
+  agree, the majority/median over 3 frames is already fixed, so the output is
+  identical to analysing all 3.
+- Simulation on the reference: K=3 needs 73% of the frames (K=5: 69%, K=7: 69%).
+- 3 files (99 videos, 30,447 output lines): output identical line-for-line to the
+  non-sequential run (30,447/30,447). Frames analysed 66,950 vs 91,234 (73%).
+  Only 6,124 of 30,408 middle frames (20%) were needed. 63.4 s vs 76.3 s
+  (still CPU/decode-bound on this pod).
+- Bug found while testing: a video could be completed and removed inside the batch
+  loop, then looked up again -> KeyError; on that error the process also hung at
+  exit (multiprocessing queue feeder thread). Fixed both.
+
+## Start-up cost
+
+- The first venv lived on the RunPod network volume (MooseFS): `import torch`
+  took ~7.9 s there. CUDA init ~6.7 s including the import; TensorRT engine
+  load 2.1 s. Wall time of a 3-file run was ~20 s more than the internal timer.
+
+## Dependencies
+
+- The working venv had sympy 1.14.0 although torch 2.5.1 pins sympy==1.13.1
+  (pulled in by later installs: onnxslim 0.1.99 / Ultralytics auto-install of
+  onnxruntime). A requirements file frozen from that venv would not install.
+  Resolved with `uv pip compile` for Python 3.11: onnxslim 0.1.98, sympy 1.13.1.

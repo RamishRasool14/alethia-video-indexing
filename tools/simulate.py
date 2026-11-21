@@ -52,9 +52,30 @@ def main():
             pred[v] = dict(enumerate(per_second(s[idx], c[idx], last)))
         r, _ = score(ref, pred)
         ok = r["f1"] >= 0.95 and r["exact"] >= 0.85 and r["within1"] >= 0.95
+        extra = ""
+        if k % 2 == 1:
+            # sequential sampling: run every other slot first (ceil(k/2) frames);
+            # run the rest only if those disagree. Same result as all k slots.
+            adaptive = 0
+            for v, (t, s, c, last) in data.items():
+                idx = pick(t, s, k)
+                si, ci = s[idx], c[idx]
+                slot = np.floor((t[idx] - si) * k + 1e-9).astype(int)
+                for sec in np.unique(si):
+                    m = si == sec
+                    first = ci[m][slot[m] % 2 == 0]
+                    rest = int((slot[m] % 2 == 1).sum())
+                    adaptive += len(first)
+                    need = (k + 1) // 2
+                    pres = first > 0
+                    agree = len(first) == need and (pres == pres[0]).all() and \
+                        (first[:, 0] == first[0, 0]).all()
+                    if not agree:
+                        adaptive += rest
+            extra = f" | sequential: {adaptive / n_frames:6.1%} frames ({adaptive / used:.0%} of K)"
         print(f"K={k:2d} frames={used / n_frames:6.1%} F1={r['f1']:.4f} "
               f"exact={r['exact']:.4f} within1={r['within1']:.4f} "
-              f"{'PASS' if ok else 'FAIL'}")
+              f"{'PASS' if ok else 'FAIL'}{extra}")
 
 
 if __name__ == "__main__":
