@@ -21,6 +21,7 @@ Main process, inference threads (2 by default):
 """
 import json
 import multiprocessing as mp
+import multiprocessing.connection as mpc
 import os
 import queue
 import sys
@@ -105,7 +106,7 @@ def _unpin(block):
 
 def run(input_dir, output_path, model_factory, n_workers, per_second_k=3, skip_nonref=False,
         sequential=True, max_batch=64, chunk_frames=32, chunks_per_worker=6,
-        gpu_threads=2, debug=False):
+        gpu_threads=2, stall_timeout=120.0, debug=False):
     import torch
 
     from .postprocess import count_classes
@@ -120,7 +121,6 @@ def run(input_dir, output_path, model_factory, n_workers, per_second_k=3, skip_n
     cfg = {"per_second": per_second_k, "skip_nonref": skip_nonref, "debug": debug,
            "sequential": sequential}
     task_q = ctx.Queue(maxsize=max(4, n_workers))
-    msg_q = ctx.Queue()
     workers = {}  # wid -> dict(proc, free_q, shm, block, current, pinned)
     retired = []  # shared memory of dead workers, freed at the end
     cuda_ready = [False]
@@ -132,12 +132,14 @@ def run(input_dir, output_path, model_factory, n_workers, per_second_k=3, skip_n
         free_q = ctx.SimpleQueue()
         for c in range(chunks_per_worker):
             free_q.put(c)
+        recv_end, send_end = ctx.Pipe(duplex=False)
         p = ctx.Process(target=worker_main, daemon=True,
-                        args=(wid, task_q, msg_q, free_q, shm.name, chunks_per_worker,
+                        args=(wid, task_q, send_end, free_q, shm.name, chunks_per_worker,
                               chunk_frames, cfg))
         p.start()
+        send_end.close()  # only the worker writes; EOF on recv_end = worker gone
         wk = dict(wid=wid, proc=p, free_q=free_q, shm=shm, block=block, current=None,
-                  pinned=False)
+                  since=None, pinned=False, conn=recv_end, eof=False)
         if cuda_ready[0]:
             wk["pinned"] = _pin(block)
         workers[wid] = wk
@@ -264,9 +266,11 @@ def run(input_dir, output_path, model_factory, n_workers, per_second_k=3, skip_n
         if kind == "start":
             _, wid, vid = msg
             workers[wid]["current"] = vid
+            workers[wid]["since"] = time.time()
             videos.setdefault(vid, VideoState())
         elif kind == "chunk":
             _, wid, cid, vid, n, h, w, secs, ckind, _ = msg
+            workers[wid]["since"] = time.time()
             st = videos[vid]
             st.chunks_sent += 1
             wk = workers[wid]
@@ -336,12 +340,40 @@ def run(input_dir, output_path, model_factory, n_workers, per_second_k=3, skip_n
             handle_result(res)
             got = True
 
+    def poll_messages(timeout):
+        """Handle all available worker messages; True if any arrived."""
+        conns = {wk["conn"]: wk for wk in workers.values() if not wk["eof"]}
+        if not conns:
+            time.sleep(timeout)
+            return False
+        got = False
+        for c in mpc.wait(list(conns), timeout=timeout):
+            wk = conns[c]
+            try:
+                while c.poll():
+                    handle(c.recv())
+                    got = True
+            except (EOFError, OSError):
+                wk["eof"] = True  # worker exited; check_workers handles it
+        return got
+
     def check_workers():
         for wid, wk in list(workers.items()):
+            # stuck decoder: no output from this worker for stall_timeout seconds
+            hung = wk["current"] is not None and time.time() - wk["since"] > stall_timeout
+            if hung:  # a decoder stuck on one video: treat it like a crash
+                wk["proc"].kill()
+                wk["proc"].join(timeout=5)
             if wk["proc"].is_alive():
                 continue
+            try:  # read everything it sent before it died
+                while wk["conn"].poll():
+                    handle(wk["conn"].recv())
+            except (EOFError, OSError):
+                pass
             vid = wk["current"]
-            log(f"worker {wid} died (exit {wk['proc'].exitcode}) on {vid}; restarting")
+            reason = "timed out" if hung else "crashed"
+            log(f"worker {wid} {reason} (exit {wk['proc'].exitcode}) on {vid}; restarting")
             # its deferred chunks can no longer be completed: analyse all frames
             for st in list(videos.values()):
                 keep = []
@@ -363,26 +395,21 @@ def run(input_dir, output_path, model_factory, n_workers, per_second_k=3, skip_n
                 st = videos[vid]
                 secs = np.concatenate(st.secs) if st.secs else np.zeros(0, np.int64)
                 st.end = (int(secs.max()) if len(secs) else -1, 0,
-                          "could not decode video: decoder crashed")
+                          f"could not decode video: decoder {reason}")
                 finalize_ready(vid)
             retired.append(wk)
             del workers[wid]
             start_worker(wid)
 
     max_in_flight = gpu_threads + 1
+    last_check = time.time()
     try:
         while True:
             while not direct_errors.empty():
                 out.write(json.dumps(direct_errors.get()) + "\n")
             got = drain_results()
-            try:
-                timeout = 0.001 if (any(n_pending.values()) or in_flight[0]) else 0.05
-                handle(msg_q.get(timeout=timeout))
-                got = True
-                while True:  # drain without blocking
-                    handle(msg_q.get_nowait())
-            except queue.Empty:
-                pass
+            timeout = 0.001 if (any(n_pending.values()) or in_flight[0]) else 0.05
+            got = poll_messages(timeout) or got
             # keep the GPU threads fed: full batches first; partial batches
             # only when the GPU would otherwise go idle
             while in_flight[0] < max_in_flight:
@@ -393,8 +420,10 @@ def run(input_dir, output_path, model_factory, n_workers, per_second_k=3, skip_n
                     break
                 submit(max(ready, key=lambda s: n_pending[s]))
                 got = True
-            if not got:
+            if not got or time.time() - last_check > 1.0:
                 check_workers()
+                last_check = time.time()
+            if not got:
                 if reader_done.is_set() and direct_errors.empty() and not in_flight[0] \
                         and stats["finished"] >= n_tasks[0] and not videos:
                     break
@@ -422,6 +451,7 @@ def run(input_dir, output_path, model_factory, n_workers, per_second_k=3, skip_n
             if wk["pinned"]:
                 _unpin(wk["block"])
             del wk["block"]
+            wk["conn"].close()
             try:
                 wk["shm"].close()
             except BufferError:  # a view may still be referenced; unlink anyway

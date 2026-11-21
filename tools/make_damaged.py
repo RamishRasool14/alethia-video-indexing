@@ -85,7 +85,7 @@ def main():
         ffmpeg(["-c:v", "mpeg4", "-q:v", "5", "-an"], short),
         ffmpeg(["-c:v", "libx265", "-an"], short),
         ffmpeg(["-c:v", "libvpx-vp9", "-b:v", "500k", "-deadline", "realtime", "-an"], short),
-        ffmpeg(["-vf", "scale=333:197", "-c:v", "libx264", "-an"], short),
+        ffmpeg(["-vf", "scale=333:197", "-c:v", "libx264", "-pix_fmt", "yuv444p", "-an"], short),
         ffmpeg(["-frames:v", "1", "-c:v", "libx264", "-an"], short),
         ffmpeg(["-vf", "scale=1920:1080", "-c:v", "libx264", "-preset", "ultrafast", "-an"],
                short),

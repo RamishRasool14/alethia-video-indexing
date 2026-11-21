@@ -15,7 +15,9 @@ disagree. When ceil(K/2) primary frames agree on every class and on the people
 count, the majority/median over all K frames is already decided, so the
 result is identical to analysing all K.
 
-Messages sent on `msg_q`:
+Messages are sent on this worker's own pipe (`conn`), synchronously from the
+worker's main thread, so a crash cannot leave a half-sent message or a held
+lock that blocks other workers:
   ("start", wid, vid)
   ("chunk", wid, chunk_id, vid, n, out_h, out_w, seconds, kind, n_primary)
       kind "p" (primary) or "d" (deferred); n_primary is a list for "d"
@@ -92,7 +94,7 @@ class ChunkWriter:
             self.send()
 
 
-def worker_main(wid, task_q, msg_q, free_q, shm_name, n_chunks, chunk_frames, cfg):
+def worker_main(wid, task_q, conn, free_q, shm_name, n_chunks, chunk_frames, cfg):
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     import av
     import cv2
@@ -102,6 +104,11 @@ def worker_main(wid, task_q, msg_q, free_q, shm_name, n_chunks, chunk_frames, cf
     from .video import _rotation_cw, rotate
 
     cv2.setNumThreads(1)
+
+    class _Sender:  # ChunkWriter expects .put()
+        put = conn.send
+
+    msg_q = _Sender()
     av.logging.set_level(av.logging.PANIC)  # damaged files: no log spam
     shm = shared_memory.SharedMemory(name=shm_name)
     block = np.ndarray((n_chunks, chunk_frames * SLOT_BYTES), np.uint8, shm.buf)
@@ -115,6 +122,12 @@ def worker_main(wid, task_q, msg_q, free_q, shm_name, n_chunks, chunk_frames, cf
             break
         vid, data = task
         msg_q.put(("start", wid, vid))
+        if os.environ.get("VIDX_TEST_CRASH") == vid:  # test hook: simulate a decoder crash
+            import signal
+            os.kill(os.getpid(), signal.SIGSEGV)
+        if os.environ.get("VIDX_TEST_HANG") == vid:  # test hook: simulate a hung decoder
+            import time
+            time.sleep(10 ** 6)
         prim = ChunkWriter("p", wid, vid, block, chunk_frames, free_q, msg_q, cv2, PAD)
         dfr = ChunkWriter("d", wid, vid, block, chunk_frames, free_q, msg_q, cv2, PAD)
         held = []  # deferred frames of the current second

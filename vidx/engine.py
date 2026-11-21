@@ -23,7 +23,43 @@ def export_onnx(weights, onnx_path):
     return onnx_path
 
 
-def build_engine(onnx_path, engine_path, max_batch=MAX_BATCH, opt_hw=OPT_HW):
+class _Calibrator:
+    """INT8 entropy calibrator fed with letterboxed uint8 frames (N, H, W, 3) BGR."""
+
+    def __new__(cls, frames, cache_path, batch=16):
+        import tensorrt as trt
+
+        class Calib(trt.IInt8EntropyCalibrator2):
+            def __init__(self):
+                super().__init__()
+                self.frames, self.batch, self.i = frames, batch, 0
+                self.cache_path = cache_path
+                self.buf = None
+
+            def get_batch_size(self):
+                return self.batch
+
+            def get_batch(self, names):
+                if self.i + self.batch > len(self.frames):
+                    return None
+                x = torch.from_numpy(self.frames[self.i:self.i + self.batch]).cuda()
+                self.buf = x.permute(0, 3, 1, 2).flip(1).float().div(255).contiguous()
+                self.i += self.batch
+                return [int(self.buf.data_ptr())]
+
+            def read_calibration_cache(self):
+                if os.path.exists(self.cache_path):
+                    return open(self.cache_path, "rb").read()
+                return None
+
+            def write_calibration_cache(self, cache):
+                open(self.cache_path, "wb").write(cache)
+
+        return Calib()
+
+
+def build_engine(onnx_path, engine_path, max_batch=MAX_BATCH, opt_hw=OPT_HW,
+                 int8_frames=None, int8_cache=None):
     import tensorrt as trt
 
     logger = trt.Logger(trt.Logger.WARNING)
@@ -42,6 +78,13 @@ def build_engine(onnx_path, engine_path, max_batch=MAX_BATCH, opt_hw=OPT_HW):
     profile.set_shape(inp.name, (1, 3, 32, 32), (max_batch, 3, *opt_hw),
                       (max_batch, 3, 640, 640))
     config.add_optimization_profile(profile)
+    if int8_frames is not None:
+        config.set_flag(trt.BuilderFlag.INT8)
+        h, w = int8_frames.shape[1:3]
+        calib_profile = builder.create_optimization_profile()
+        calib_profile.set_shape(inp.name, (16, 3, h, w), (16, 3, h, w), (16, 3, h, w))
+        config.set_calibration_profile(calib_profile)
+        config.int8_calibrator = _Calibrator(int8_frames, int8_cache)
     data = builder.build_serialized_network(network, config)
     if data is None:
         raise RuntimeError("TensorRT engine build failed")

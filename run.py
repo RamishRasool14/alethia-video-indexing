@@ -110,7 +110,8 @@ def run_fast(args):
 
     run(args.input, args.output, model_factory=get_model, n_workers=n_workers,
         per_second_k=args.per_second, skip_nonref=args.skip_nonref,
-        sequential=not args.no_sequential, max_batch=args.batch, debug=args.debug)
+        sequential=not args.no_sequential, max_batch=args.batch,
+        stall_timeout=args.stall_timeout, debug=args.debug)
 
 
 def main():
@@ -128,6 +129,8 @@ def main():
                     help="analyse all sampled frames (no sequential sampling)")
     ap.add_argument("--workers", type=int, default=0, help="decode processes (0 = auto)")
     ap.add_argument("--batch", type=int, default=64)
+    ap.add_argument("--stall-timeout", type=float, default=120.0,
+                    help="kill a decode worker that produces nothing for this many seconds")
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
     if args.mode == "simple":

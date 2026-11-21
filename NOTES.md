@@ -78,6 +78,8 @@ aggregated with the brief's rules, scored against all frames:
 | 21 Nov 13:33 | v1-simple (tag), K=3, 1 process, Ultralytics FP32 bs32 | 50 files | stopped after 340 s | | | | Processed 12,838 video-seconds in 340 s (~37.8 video-s per s), i.e. ~3.4 h projected for 461,757 s. Stopped to free the GPU for development; to be re-run in full, undisturbed. |
 | 21 Nov 14:20 | fast v2: 13 decode processes + shared memory + TensorRT FP16 bs64 + GPU NMS, K=3 | 50 files | 940.5 s (internal timer; excludes ~20 s start-up) | 0.9824 | 0.9495 | 0.9967 | 1,383,597 frames analysed, 1,474 frames/s. CPU-bound: 13 workers decoding every frame. GPU ~80% busy. 0 error lines. |
 
+| 21 Nov 14:45 | v3: + 2 GPU inference threads (own TensorRT context + CUDA stream each), pinned shared memory, sequential sampling, --skip-nonref, venv on local disk | 50 files | 589.0 s wall | 0.9828 | 0.9516 | 0.9969 | 1,008,201 frames analysed (deferred middle frames run: 86,588 of 460,639 = 18.8%). 1,735 frames/s; GPU-bound on this pod (3 batches in flight, frames pending). 0 error lines, 461,757 lines. |
+
 ## Sequential sampling (K=3)
 
 - Idea: analyse slots 0 and 2 of each second first; analyse slot 1 only if those
@@ -105,3 +107,46 @@ aggregated with the brief's rules, scored against all frames:
   (pulled in by later installs: onnxslim 0.1.99 / Ultralytics auto-install of
   onnxruntime). A requirements file frozen from that venv would not install.
   Resolved with `uv pip compile` for Python 3.11: onnxslim 0.1.98, sympy 1.13.1.
+
+## GPU loop (3-file subset, 99 videos)
+
+- Before: one main thread did message handling, host->GPU copy from ordinary
+  (pageable) shared memory, TensorRT, NMS and the read-back in series.
+  Workers often sat idle waiting for free chunks (top: several at 0% CPU).
+  GPU-bound test (15 frames/s, no sequential): 455,956 frames in 310.1 s =
+  1,470 frames/s.
+- After: 2 inference threads with their own TensorRT execution contexts and
+  CUDA streams; shared-memory blocks page-locked with cudaHostRegister. Same
+  GPU-bound test: 261.6 s = 1,743 frames/s (peaks 1,807). TensorRT alone
+  (synthetic input): ~2,000 frames/s. Output identical.
+- With the venv on local disk: torch import 1.81 s, CUDA init 0.27 s,
+  torchvision 1.16 s, tensorrt 0.05 s, av/cv2/pyarrow 0.29 s, engine load 0.31 s.
+  `model ready` is logged ~3.4-4.3 s after start.
+
+## Decode cost (one core, this pod's EPYC 7452)
+
+- ~1,700 frames/s (~590 us CPU per frame) for decode alone; exact Fraction
+  timestamp maths adds nothing measurable; + bgr24 conversion of the 3 sampled
+  frames/s: ~670 us/frame.
+- skip_frame=NONREF on 12 videos: 34.26 s -> 22.08 s (81,109 -> 46,608 frames
+  decoded). NONKEY/NONINTRA: 896 frames only (too sparse).
+- In the pipeline on the 3-file subset: default 59.3 s, --skip-nonref 55.1 s.
+
+## Robustness (tools/make_damaged.py, plus test hooks)
+
+18-row damaged Parquet + one invalid Parquet file. Fast and simple modes give the
+same structure for every row:
+- truncated 50% -> 27 s of lines + error; truncated 5% -> 9 s + error;
+- random bytes overwritten (bit rot) -> decodes fully (FFmpeg conceals);
+- header only -> "no frames decoded"; random bytes, audio-only (no video stream)
+  -> one error line; empty/null -> "empty mp4 bytes";
+- rotated 90/270, VFR, MPEG-4 Part 2, HEVC, VP9, 333x197 (yuv444p), single frame,
+  1080p -> normal lines;
+- invalid Parquet file -> one error line (`<file>:0`).
+- Simulated decoder crash (SIGSEGV in a worker) and hang (killed after
+  --stall-timeout with no output): first attempt hung the whole run, because
+  all workers shared one multiprocessing.Queue whose background feeder thread
+  can lose the last message (or hold the shared lock) when the process dies.
+  Fixed by giving each worker its own pipe with synchronous sends. Now: worker
+  replaced, one error line for that video, other 31 videos' 8,550 lines
+  identical to a normal run, run finishes in 27.1 s.
