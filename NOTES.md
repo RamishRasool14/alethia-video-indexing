@@ -150,3 +150,20 @@ same structure for every row:
   Fixed by giving each worker its own pipe with synchronous sends. Now: worker
   replaced, one error line for that video, other 31 videos' 8,550 lines
   identical to a normal run, run finishes in 27.1 s.
+
+## INT8 experiment (rejected)
+
+- TensorRT INT8+FP16 engine, entropy calibration on 1,024 letterboxed 640x360
+  frames from files 40-49 (tools/build_int8.py). Build 1,080 s.
+- Speed (synthetic 64x3x384x640, incl. NMS): INT8 3,836 frames/s vs FP16 1,982.
+- Full 50 files, same pipeline otherwise: 452.4 s wall (FP16: 589.0 s; this pod
+  is CPU-bound with INT8). Accuracy vs reference: F1 0.9537, exact 0.9017,
+  within1 0.9801 (tp 10,577, fp 141, fn 885). FP16: F1 0.9828, fn 220.
+  Passes, but only 0.004 above the F1 threshold; false negatives x4.
+- Not used.
+
+## Defaults after these tests
+
+- B-frame skipping made the default (`--no-skip-nonref` turns it off): faster
+  and the per-video number of output seconds was identical to full decoding
+  for all 1,650 videos.

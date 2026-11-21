@@ -49,7 +49,8 @@ Options (defaults are the submitted configuration):
 |---|---|---|
 | `--per-second K` | 3 | Frames sampled per second (first frame in each 1/K-second slot); 0 = every frame |
 | `--no-sequential` | off | Analyse every sampled frame. By default, for odd K, the even slots are analysed first and the odd slots only when those disagree (identical output, fewer frames) |
-| `--skip-nonref` | off | Do not decode non-reference (B) frames |
+| `--no-skip-nonref` | off | Decode every frame. By default non-reference (B) frames are not decoded, which makes decoding ~35% cheaper; sampling then uses the decoded frames |
+| `--stall-timeout S` | 120 | Kill and replace a decode worker that produces nothing for S seconds (its video gets an error line) |
 | `--workers N` | CPUs - 1 | Decode processes |
 | `--batch N` | 64 | Frames per GPU batch |
 | `--mode simple` | `fast` | The first, single-process version (Ultralytics `predict`), kept for comparison |
@@ -60,7 +61,8 @@ Options (defaults are the submitted configuration):
    one task per row. Rows that cannot be read become error lines.
 2. Decode worker processes (one per CPU) decode each video with PyAV,
    apply any rotation tag, take timestamps from the first decoded frame,
-   keep 3 frames per second, letterbox them exactly like Ultralytics (640,
+   keep 3 frames per second (skipping non-reference B-frames, which are
+   never decoded), letterbox them exactly like Ultralytics (640,
    stride-32 minimum padding, grey 114) and write them into shared memory.
 3. Two GPU threads, each with its own CUDA stream and TensorRT execution
    context, copy batches from pinned shared memory, convert BGR to RGB,

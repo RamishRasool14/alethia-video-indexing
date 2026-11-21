@@ -123,8 +123,8 @@ def main():
     ap.add_argument("--engine", default=os.path.join(HERE, "yolo11l.engine"))
     ap.add_argument("--per-second", type=int, default=3,
                     help="frames analysed per second (0 = every frame)")
-    ap.add_argument("--skip-nonref", action="store_true",
-                    help="do not decode non-reference (B) frames")
+    ap.add_argument("--no-skip-nonref", dest="skip_nonref", action="store_false",
+                    help="decode every frame (default: skip non-reference B-frames)")
     ap.add_argument("--no-sequential", action="store_true",
                     help="analyse all sampled frames (no sequential sampling)")
     ap.add_argument("--workers", type=int, default=0, help="decode processes (0 = auto)")
