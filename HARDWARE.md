@@ -12,4 +12,11 @@ data centre EUR-IS-2).
 | OS | Ubuntu 22.04.5 LTS (container), Linux kernel 6.8.0 |
 | Python | 3.11.10 |
 
-Full run of all 50 files (start to finish): _filled in after the final run_.
+**Full run of all 50 files, start to finish: 620.3 seconds (10 min 20 s)**,
+measured as wall-clock time around `python run.py --input finevideo/data
+--output results.jsonl` (21 Nov 2026, 16:28 PKT, commit a40a387, after
+`prepare.py` had built the TensorRT engine). 1,650 videos, 128.0 hours of
+video, 461,757 output lines.
+
+Note: this pod has a CPU quota of 13.6 cores, so its runs are partly limited by
+video decoding on the CPU; the grading machine has 32 threads.
